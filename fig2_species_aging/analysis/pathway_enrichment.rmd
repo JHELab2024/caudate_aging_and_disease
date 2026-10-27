@@ -1,0 +1,88 @@
+---
+title: "Fig. 2 | 03 Ranked GSEA of the older-vs-younger effects"
+output: pdf_document
+---
+
+Input: the original joint-model DE restored by `02_import_de.rmd`; no DE fitting occurs here. `fgsea` on every tested gene ranked by the moderated t, per species and cell type, with the frozen catalogue (C8 cell-type sets excluded; they are used only for NMF annotation). Gene sets of 15–500 genes after intersection. Macaque genes are matched to the human catalogue by symbol (ortholog provenance open). Positive NES = higher in older donors.
+
+The pseudobulk rows use older gene symbols (GBA, YARS, H3F3A, SEPT7) than MSigDB 2025.1 (GBA1, YARS1, H3-3A, SEPTIN7). A catalogue symbol is replaced by the data's symbol only when, in the full NCBI Gene symbol and synonym table (org.Hs.eg.db 3.21.0, Entrez Gene 2025-02-22), the data symbol names exactly one gene once genes already present as another data row (under their current or an unambiguous older symbol) are excluded, that gene's current symbol is not itself a row of either species' pseudobulk, and no other data symbol maps to it. Unresolved symbols (e.g. NPIPB5, ARL17A, DUSP13) stay unmapped. The same translation is used for every species and cell type; translated and unmapped pairs are saved (`GSEA_symbol_translation.csv`, `GSEA_symbol_unmapped.csv`).
+
+```{r message=FALSE, warning=FALSE}
+dir.create("../results/gsea",recursive=TRUE,showWarnings=FALSE)
+  library(fgsea)
+  library(dplyr)
+  library(org.Hs.eg.db)
+  catalogue = readRDS("../../data/references/pathway_catalogue.rds")
+  catalogue = catalogue[catalogue$collection != "C8", ]
+
+  # catalogue symbol -> data symbol, one-to-one only, ambiguity checked on the full alias table before any restriction to data or catalogue
+  genes = union(rownames(readRDS("../../data/derived/human_pseudobulk.rds")$counts), rownames(readRDS("../../data/derived/monkey_pseudobulk.rds")$counts))
+  alias = merge(AnnotationDbi::toTable(org.Hs.egALIAS2EG), AnnotationDbi::toTable(org.Hs.egSYMBOL), by = "gene_id")
+  alias$keep = !alias$alias_symbol %in% alias$alias_symbol[duplicated(alias$alias_symbol)]   # names one Entrez gene in the full table (every current symbol is also its own gene's alias)
+  alias = alias[alias$keep | alias$alias_symbol == alias$symbol | !alias$gene_id %in% alias$gene_id[alias$alias_symbol %in% genes & (alias$keep | alias$alias_symbol == alias$symbol)], ]   # a gene that another data row already is cannot be this row
+  alias$keep = !alias$alias_symbol %in% alias$alias_symbol[duplicated(alias$alias_symbol)]
+  alias = unique(alias[alias$alias_symbol %in% genes & !alias$alias_symbol %in% catalogue$gene & alias$symbol %in% catalogue$gene & !alias$symbol %in% genes, c("alias_symbol", "symbol", "keep")])
+  alias$keep = alias$keep & !alias$symbol %in% alias$symbol[alias$keep][duplicated(alias$symbol[alias$keep])]   # one data symbol per catalogue symbol
+  write.csv(alias[!alias$keep, c("alias_symbol", "symbol")], "../results/gsea/GSEA_symbol_unmapped.csv", row.names = FALSE)
+  alias = alias[alias$keep, ]
+  i = match(catalogue$gene, alias$symbol)
+  catalogue$gene[!is.na(i)] = alias$alias_symbol[i[!is.na(i)]]
+  nrow(alias)
+  write.csv(data.frame(data_symbol = alias$alias_symbol, catalogue_symbol = alias$symbol), "../results/gsea/GSEA_symbol_translation.csv", row.names = FALSE)
+  sets = split(catalogue$gene, paste(catalogue$collection, catalogue$pathway, sep = "::"))
+  de = readRDS("../results/de/DE_old_vs_young.rds")
+```
+
+```{r}
+  set.seed(1)
+  gsea = list()
+  for (sp in c("human", "monkey")) for (ct in unique(de$celltype[de$species == sp])) {
+    message(sp, " / ", ct)
+    d = de[de$species == sp & de$celltype == ct, ]
+    d = d[is.finite(d$t) & !is.na(d$gene), ]
+    ranks = sort(setNames(d$t, d$gene), decreasing = TRUE)
+    g = fgseaMultilevel(pathways = sets, stats = ranks, minSize = 15, maxSize = 500, eps = 0, nproc = 1)
+    g$leadingEdge = sapply(g$leadingEdge, paste, collapse = ";")
+    gsea[[paste(sp, ct)]] = data.frame(species = sp, celltype = ct, g)
+  }
+  gsea = bind_rows(gsea)
+  gsea %>% group_by(species, celltype) %>% summarise(sets = n(), up = sum(padj < 0.05 & NES > 0), down = sum(padj < 0.05 & NES < 0), .groups = "drop")
+  saveRDS(gsea, "../results/gsea/GSEA_old_vs_young.rds")
+  write.csv(gsea, "../results/gsea/GSEA_old_vs_young.csv", row.names = FALSE)
+```
+
+
+## Fixed Lu 2004 and MitoCarta reference GSEA
+
+User-approved addition to the frozen DE analysis. Read the nine reference gene sets already used for descriptive scoring: seven original MitoCarta3.0 top-level categories and Lu 2004 aging-up/down. Their saved catalogue-to-data symbol translation is retained. Rank all tested genes by the original joint-model Old−Young moderated t, separately for each species and CELLTYPE, as in the catalogue section above. fgseaMultilevel uses minSize=15, maxSize=500, eps=0, nproc=1 and seed 1. Positive NES means enrichment toward higher expression in older donors. No DE, original catalogue GSEA, donor scores or ortholog mapping is recomputed.
+
+BH correction is within the fixed nine-reference family for each species×CELLTYPE. This differs from the original catalogue-wide BH correction and is explicitly named in the output; q values must not be compared as if the test families were identical. Coverage records the genes actually represented in the ranked DE universe, not the different expression-filtered donor-score universe. All nine references are displayed regardless of direction or significance. References were selected during exploration and are not a preregistered confirmatory test.
+
+```{r message=FALSE, warning=FALSE}
+library(fgsea)
+library(dplyr)
+de = readRDS("../results/de/DE_old_vs_young.rds")
+reference = readRDS("../results/gsea/reference_gene_sets.rds")
+sets = reference$mapped[c("LU_AGING_BRAIN_UP","LU_AGING_BRAIN_DN",setdiff(names(reference$mapped),c("LU_AGING_BRAIN_UP","LU_AGING_BRAIN_DN")))]
+results = list(); coverage = list()
+set.seed(1)
+for (sp in c("human","monkey")) for (ct in unique(de$celltype[de$species == sp])) {
+  d = de[de$species == sp & de$celltype == ct & is.finite(de$t) & !is.na(de$gene), ]
+  ranks = sort(setNames(d$t,d$gene),decreasing=TRUE)
+  g = fgseaMultilevel(pathways=sets,stats=ranks,minSize=15,maxSize=500,eps=0,nproc=1)
+  g$leadingEdge = sapply(g$leadingEdge,paste,collapse=";")
+  results[[paste(sp,ct)]] = data.frame(species=sp,celltype=ct,g,adjustment="BH within 9 reference sets per species-CELLTYPE")
+  for (name in names(sets)) {
+    genes = intersect(sets[[name]],names(ranks))
+    coverage[[paste(sp,ct,name)]] = data.frame(species=sp,celltype=ct,pathway=name,
+      original_genes=length(reference$original[[name]]),mapped_genes=length(sets[[name]]),
+      ranked_genes=length(genes),mt_genes=sum(grepl("^MT-",genes)),genes=paste(genes,collapse=";"))
+  }
+  message(sp," / ",ct,": ",nrow(g)," reference sets")
+}
+results = bind_rows(results)
+saveRDS(results,"../results/gsea/GSEA_reference_old_vs_young.rds")
+write.csv(results,"../results/gsea/GSEA_reference_old_vs_young.csv",row.names=FALSE)
+write.csv(bind_rows(coverage),"../results/gsea/reference_gsea_coverage.csv",row.names=FALSE)
+results %>% group_by(species,pathway) %>% summarise(tested=n(),up=sum(NES>0 & padj<0.05),down=sum(NES<0 & padj<0.05),.groups="drop")
+```

@@ -1,0 +1,50 @@
+---
+title: "Fig. 5 | 04 Disease, control aging and age-by-disease DE"
+output: html_document
+---
+
+Run the frozen designs from 03 on raw counts, separately per cohort/region. TMM, expression filtering on the biological comparison, ordinary voom, limma and robust empirical Bayes. No SVA or quality weights. Positive disease logFC means higher in cases; slopes are per decade; interaction is case slope minus control slope. All tested genes, P, BH, effect and moderated standard error are retained. BH within each model/contrast is primary; an across-model BH column is provided by disease/analysis/readout. Reference: [limma-voom workflow](https://www.bioconductor.org/packages/release/workflows/vignettes/RNAseq123/inst/doc/limmaWorkflow.html).
+
+```{r message=FALSE}
+  library(edgeR)
+  library(limma)
+  library(dplyr)
+  models = readRDS("../results/model_designs.rds")
+  results = list()
+  coverage = list()
+  voom_trends = list()
+  current = ""
+```
+
+```{r}
+  for (id in names(models)) {
+    z = models[[id]]
+    key = paste(z$spec$cohort, z$spec$region, sep = "__")
+    if (key != current) { block = readRDS(paste0("../../data/derived/bulk/", key, ".rds")); current = key }
+    m = z$meta
+    y = DGEList(block$counts[, m$sample_id, drop = FALSE])
+    keep = if (z$spec$analysis == "control_age") filterByExpr(y, design = model.matrix(~ age10, m)) else filterByExpr(y, group = m$group)
+    coverage[[id]] = data.frame(model_id = id, n_genes = sum(keep), n_profiles = ncol(y), status = if (sum(keep) >= 10) "ready" else "too_few_genes")
+    if (sum(keep) < 10) next
+    y = calcNormFactors(y[keep, , keep.lib.sizes = FALSE])
+    v = voom(y, z$design, plot = FALSE, save.plot = TRUE)
+    voom_trends[[id]] = v$voom.line
+    fit = eBayes(contrasts.fit(lmFit(v, z$design), z$contrasts), robust = TRUE)
+    for (r in colnames(z$contrasts)) {
+      tab = topTable(fit, coef = r, number = Inf, sort.by = "none")
+      tab$SE_moderated = fit$stdev.unscaled[, r] * sqrt(fit$s2.post)
+      results[[paste(id, r, sep = "|")]] = data.frame(model_id = id, z$spec, readout = r, gene = rownames(y), age_center = z$age_center, tab, row.names = NULL)
+    }
+    message(id)
+  }
+  de = bind_rows(results)
+  stopifnot(nrow(de) > 0)
+  de = de %>% group_by(disease, analysis, readout) %>% mutate(adj.P.Val_all = p.adjust(P.Value, "BH")) %>% ungroup()
+  saveRDS(de, "../results/bulk_DE.rds")
+  data.table::fwrite(de, "../results/bulk_DE.csv.gz")
+  saveRDS(voom_trends, "../results/voom_trends.rds")
+  write.csv(bind_rows(coverage), "../results/DE_coverage.csv", row.names = FALSE)
+  summary = de %>% group_by(cohort, region, disease, analysis, readout) %>%
+    summarise(n_tested = n(), up = sum(adj.P.Val < 0.05 & logFC > 0), down = sum(adj.P.Val < 0.05 & logFC < 0), .groups = "drop")
+  write.csv(summary, "../results/DE_summary.csv", row.names = FALSE)
+```

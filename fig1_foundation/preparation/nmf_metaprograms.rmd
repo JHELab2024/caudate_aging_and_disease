@@ -1,0 +1,160 @@
+---
+title: "Fig. 1 | 05 Robust NMF programs and metaprograms (Gavish et al. 2023)"
+output: html_document
+---
+
+Gavish post-factorization steps, run separately for each species and cell type (no shared human–macaque clustering):
+
+1. robust within sample: ≥ 30 of 50 genes shared with a program of the same sample at another available K (user's atlas adaptation);
+2. robust across samples: ≥ 10 genes shared with a within-robust program of another sample;
+3. non-redundant within sample: programs ranked by that across-sample overlap and kept greedily, dropping any program sharing ≥ 10 genes with one already kept;
+4. greedy clustering into metaprograms (MPs): the founder is the program with the most ≥ 10-gene overlaps (must exceed 5 in human), programs are added while they share ≥ 10 genes with the current MP, and the MP is the 50 genes found in the most cluster programs (ties broken by the highest W).
+
+MPs receive descriptive QC flags: ribosomal/mitochondrial enrichment, a single sequencing pool, or ≥50% foreign-marker genes (notebook 00). These flags do not remove an MP. Macaque MPs require ≥2 distinct animals. No technical-noise exclusions have been adjudicated; all discovery-eligible MPs remain available for the atlas and downstream analyses.
+
+MP boundary ties use the maximum raw W over every contributing program, including loadings outside that program's top 50. The full W vectors are read from the verified consensus files only for non-redundant robust programs. Human founder and non-redundancy rules are unchanged.
+
+```{r message=FALSE, warning=FALSE}
+  library(Matrix)
+  library(dplyr)
+  programs = readRDS("../../data/derived/nmf_programs.rds")
+  pb_human = readRDS("../../data/derived/human_pseudobulk.rds")
+  pb_monkey = readRDS("../../data/derived/monkey_pseudobulk.rds")
+  pool = unique(pb_human$meta[, c("sample_names", "dataset")])
+  types = sort(unique(programs$celltype))
+  coverage = read.csv("../results/nmf/nmf_consensus_coverage.csv", stringsAsFactors = FALSE)
+```
+
+```{r}
+  mp_genes = list(); clusters = list(); info = list(); robust_table = list(); similarity = list()
+  for (sp in c("human", "monkey")) for (ct in types) {
+    x = programs[programs$species == sp & programs$celltype == ct, ]
+    if (nrow(x) == 0) next
+    top = split(x$gene, x$program)
+    prog = names(top)
+    donor = x$donor[match(prog, x$program)]
+    K = x$K[match(prog, x$program)]
+
+    # 1. shared top-50 genes between every pair of programs (incidence matrix cross-product)
+    inc = sparseMatrix(i = match(x$gene, unique(x$gene)), j = match(x$program, prog), x = 1)
+    overlap = as.matrix(crossprod(inc))
+    dimnames(overlap) = list(prog, prog)
+
+    # 2. robust within sample
+    same_sample = outer(donor, donor, "==") & outer(K, K, "!=")
+    within = apply(overlap * same_sample, 1, max) >= 30
+
+    # 3. robust across samples
+    keep = prog[within]
+    other_sample = outer(donor[within], donor[within], "!=")
+    across_max = setNames(numeric(length(keep)), keep)
+    if (length(keep) > 1) across_max = apply(overlap[keep, keep, drop = FALSE] * other_sample, 1, max)
+    keep = keep[across_max >= 10]
+
+    # 4. non-redundant within sample
+    robust = c()
+    for (d in unique(donor[match(keep, prog)])) {
+      cand = keep[donor[match(keep, prog)] == d]
+      cand = cand[order(across_max[cand], decreasing = TRUE)]
+      chosen = c()
+      for (p in cand) if (length(chosen) == 0 || max(overlap[p, chosen]) < 10) chosen = c(chosen, p)
+      robust = c(robust, chosen)
+    }
+    robust_table[[paste(sp, ct)]] = data.frame(species = sp, celltype = ct, program = prog, donor = donor, K = K,
+                                               within_robust = within, across_robust = prog %in% keep, robust = prog %in% robust)
+
+    # 5. recover complete W for the robust programs, once per consensus file
+    full_w = list()
+    files = coverage[coverage$species == sp & coverage$celltype == ct & coverage$available, ]
+    for (i in seq_len(nrow(files))) {
+      prefix = paste0(files$donor[i], "|K", files$K[i], "_P")
+      wanted = robust[startsWith(robust, prefix)]
+      if (length(wanted) == 0) next
+      tab = data.table::fread(files$file[i], check.names = FALSE, nThread = 2)
+      w = as.matrix(tab[, -1, with = FALSE])
+      for (p in wanted) full_w[[p]] = setNames(as.numeric(w[as.integer(sub(prefix, "", p, fixed = TRUE)), ]), colnames(w))
+    }
+
+    # 6. greedy clustering into MPs
+    min_group = 5
+    if (sp == "monkey") min_group = 0   # one other program permits a two-animal founder
+    remaining = robust
+    k = 1
+    repeat {
+      if (length(remaining) < 2) break
+      n_overlap = rowSums(overlap[remaining, remaining] >= 10) - 1
+      if (max(n_overlap) <= min_group) break
+      founder = names(which.max(n_overlap))
+      cluster = founder
+      mp = top[[founder]]
+      best_w = full_w[[founder]]
+      remaining = setdiff(remaining, founder)
+      repeat {
+        if (length(remaining) == 0) break
+        hit = sapply(top[remaining], function(g) length(intersect(g, mp)))
+        if (max(hit) < 10) break
+        add = names(which.max(hit))
+        cluster = c(cluster, add)
+        remaining = setdiff(remaining, add)
+        y = x[x$program %in% cluster, ]
+        freq = table(y$gene)
+        added_w = full_w[[add]]
+        common = intersect(names(best_w), names(added_w))
+        best_w[common] = pmax(best_w[common], added_w[common])
+        novel = setdiff(names(added_w), names(best_w))
+        best_w[novel] = added_w[novel]
+        genes = names(freq)
+        mp = genes[order(-as.numeric(freq[genes]), -best_w[genes], genes)][1:50]
+      }
+      name = paste(sp, ct, paste0("MP", k), sep = "|")
+      mp_genes[[name]] = mp
+      clusters[[name]] = cluster
+
+      # 7. annotations, not automatic technical exclusions
+      universe = unique(x$gene)
+      ribo = grepl("^RP[SL][0-9]+[A-Z]*$|^RPLP[0-9]$|^MT-", mp)
+      ribo_universe = sum(grepl("^RP[SL][0-9]+[A-Z]*$|^RPLP[0-9]$|^MT-", universe))
+      donors_in = unique(donor[match(cluster, prog)])
+      foreign = if (sp == "human") pb_human$foreign[[ct]] else pb_monkey$foreign[[ct]]
+      info[[name]] = data.frame(species = sp, celltype = ct, mp = paste0("MP", k), n_programs = length(cluster),
+                                n_donors = length(donors_in), n_pools = if (sp == "human") length(unique(na.omit(pool$dataset[match(donors_in, pool$sample_names)]))) else NA_integer_,
+                                ribo_mito_genes = sum(ribo),
+                                p_ribo_mito = phyper(sum(ribo) - 1, ribo_universe, length(universe) - ribo_universe, 50, lower.tail = FALSE),
+                                foreign_fraction = mean(mp %in% foreign), genes = paste(mp, collapse = ";"))
+      k = k + 1
+    }
+    # 8. Jaccard similarity of the robust programs for the overview heatmap (Gavish Fig. 2a):
+    #    programs of each MP in the order they joined, MPs in the order they formed, unassigned robust programs last
+    assigned = unlist(clusters[startsWith(names(clusters), paste0(sp, "|", ct, "|"))])
+    ordered = c(assigned, setdiff(robust, assigned))
+    shared = overlap[ordered, ordered, drop = FALSE]
+    similarity[[paste(sp, ct, sep = "|")]] = shared / (100 - shared)
+
+    print(paste(sp, ct, length(robust), "robust programs,", k - 1, "MPs"))
+  }
+```
+
+```{r}
+  info = bind_rows(info)
+  if (nrow(info) == 0) info = data.frame(species = character(), celltype = character(), mp = character(),
+    n_programs = integer(), n_donors = integer(), n_pools = integer(), ribo_mito_genes = integer(),
+    p_ribo_mito = numeric(), foreign_fraction = numeric(), genes = character())
+  info$fdr_ribo_mito = ave(info$p_ribo_mito, info$species, FUN = function(p) p.adjust(p, "BH"))
+  info$flag_ribo_mito = info$fdr_ribo_mito < 0.05
+  info$flag_single_pool = info$species == "human" & !is.na(info$n_pools) & info$n_pools == 1
+  info$flag_doublet_like = info$foreign_fraction >= 0.5
+  info$flag_few_animals = info$species == "monkey" & info$n_donors < 2
+  info$technical_noise_confirmed = rep(FALSE, nrow(info))
+  info$technical_noise_reason = rep("", nrow(info))
+  info$keep = !info$flag_few_animals
+  info$keep_downstream = info$keep & !info$technical_noise_confirmed
+  info$id = paste(info$species, info$celltype, info$mp, sep = "|")
+  table(info$species, info$keep)
+  robust_table = bind_rows(robust_table)
+  robust_table %>% group_by(species, celltype) %>% summarise(programs = n(), robust = sum(robust), samples = n_distinct(donor), .groups = "drop")
+
+  saveRDS(list(genes = mp_genes, clusters = clusters, info = info), "../../data/derived/nmf_metaprograms.rds")
+  write.csv(info, "../results/nmf/nmf_metaprograms.csv", row.names = FALSE)
+  write.csv(robust_table, "../results/nmf/nmf_robust_programs.csv", row.names = FALSE)
+  saveRDS(similarity, "../results/nmf/nmf_robust_program_jaccard.rds")
+```

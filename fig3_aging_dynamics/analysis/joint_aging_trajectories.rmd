@@ -1,0 +1,73 @@
+---
+title: "Fig3 | Joint aging trajectories across CELLTYPEs"
+output: html_document
+---
+
+Run from `analysis/`. Reuse the verified 35–78-year, half-year LOESS matrices and all expressed genes from analysis/04. Jointly cluster CELLTYPE_gene rows within neuron and non-neuron; retain the original Dmin k=2:22, estimated fuzzifier, center-correlation >0.8 reduction and core membership >0.5. No donor, adjustment, DE threshold or old membership is changed. Ependymal lacks the original age coverage and remains unclustered. B displays age-stage P<0.05 rows; overall clusters use all eligible features. These are descriptive cross-sectional trajectories, not independent observations at each predicted age.
+
+```{r}
+library(e1071); library(dplyr); library(data.table); library(fgsea)
+dir.create("../results/dynamics",showWarnings=FALSE)
+style = readRDS("../../data/derived/plot_style.rds")
+linear = readRDS("../results/linear_age_DE.rds")
+stages = readRDS("../results/age_stage_DE.rds")
+old = readRDS("../results/trajectory_clusters.rds")
+for (compartment in c("neuron","non_neuron")) {
+  if (file.exists(paste0("../results/dynamics/joint_",compartment,".rds"))) next
+  types = intersect(style$celltype_order, unique(old$celltype))
+  types = types[(types %in% c(style$msn,"Interneuron")) == (compartment == "neuron")]
+  matrices = list(); metadata = list()
+  for (ct in types) {
+    x = readRDS(paste0("../results/plot_inputs/round1/trajectory_",tolower(gsub("[^A-Za-z0-9]+","_",ct)),".rds"))
+    id = paste(ct,rownames(x),sep="::")
+    l = linear[linear$celltype==ct,]; a = stages[stages$celltype==ct,]
+    metadata[[ct]] = data.frame(id,celltype=ct,gene=rownames(x),rho=l$rho[match(rownames(x),l$gene)],
+      stage_changed=rownames(x) %in% a$gene[a$P.Value<0.05])
+    rownames(x) = id; matrices[[ct]] = x
+  }
+  x = do.call(rbind,matrices); info = bind_rows(metadata)
+  N = nrow(x); D = ncol(x)
+  fuzzifier = 1+(1418/N+22.05)*D^(-2)+(12.33/N+0.243)*D^(-0.0406*log(N)-0.1134)
+  set.seed(1); dmin = numeric(21)
+  for (k in 2:22) {
+    fit = cmeans(x,centers=k,m=fuzzifier,iter.max=100)
+    dmin[k-1] = min(dist(fit$centers))
+    cat(compartment,"k",k,"Dmin",dmin[k-1],format(Sys.time()),"\n")
+  }
+  xx = (2:22-2)/20; yy = (dmin-min(dmin))/diff(range(dmin))
+  k_best = (2:22)[which.max(abs(yy-(yy[1]+(tail(yy,1)-yy[1])*xx)))]
+  fit = cmeans(x,centers=k_best,m=fuzzifier,iter.max=100)
+  k_final = max(cutree(hclust(as.dist(1-cor(t(fit$centers))),method="complete"),h=0.2))
+  if (k_final<k_best) fit = cmeans(x,centers=k_final,m=fuzzifier,iter.max=100)
+  # Name clusters by their dendrogram order, using the same identity in every new panel.
+  order = hclust(as.dist(1-cor(t(fit$centers))),method="complete")$order
+  info$cluster = match(fit$cluster,order)
+  info$membership = apply(fit$membership,1,max); info$core = info$membership>0.5
+  centers = fit$centers[order,,drop=FALSE]; rownames(centers) = seq_len(k_final)
+  saveRDS(list(trajectory=x,info=info,centers=centers,age=as.numeric(colnames(x)),fuzzifier=fuzzifier,
+    k_initial=k_best,k_final=k_final,dmin=dmin),paste0("../results/dynamics/joint_",compartment,".rds"))
+  fwrite(info,paste0("../results/dynamics/membership_",compartment,".csv.gz"))
+  write.csv(data.frame(k=2:22,dmin,initial=k_best,final=k_final),paste0("../results/dynamics/cluster_choice_",compartment,".csv"),row.names=FALSE)
+  cat(compartment,"finished",N,"features",k_final,"clusters\n")
+}
+```
+
+Enrichment is done within each CELLTYPE's core cluster membership, with its full eligible gene universe. Gene symbols and gene-set catalogue are exactly the existing Fig3/4 mapping. A recurrent gene in different CELLTYPEs is never counted as several genes in one enrichment test. BH is within each CELLTYPE × cluster over all tested sets. Complete results are retained; networks later condense redundant terms for display.
+
+```{r}
+sets = readRDS("../../fig4_aging_AUD/results/gene_sets.rds")
+ora = list()
+for (compartment in c("neuron","non_neuron")) {
+  obj = readRDS(paste0("../results/dynamics/joint_",compartment,".rds")); info = obj$info
+  for (ct in unique(info$celltype)) for (k in sort(unique(info$cluster))) {
+    z = info[info$celltype==ct,]; genes = z$gene[z$cluster==k & z$core]
+    if (length(genes)<5) next
+    e = fora(sets,genes=genes,universe=z$gene,minSize=15,maxSize=500)
+    e$overlapGenes = vapply(e$overlapGenes,paste,collapse=";",FUN.VALUE=character(1))
+    ora[[paste(compartment,ct,k)]] = data.frame(compartment,celltype=ct,cluster=k,n_core=length(genes),e)
+  }
+  cat(compartment,"enrichment complete\n")
+}
+fwrite(bind_rows(ora),"../results/dynamics/cluster_enrichment.csv.gz")
+writeLines(capture.output(sessionInfo()),"../results/dynamics/session_analysis.txt")
+```

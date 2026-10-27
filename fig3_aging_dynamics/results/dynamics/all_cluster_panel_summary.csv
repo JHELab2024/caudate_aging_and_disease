@@ -1,0 +1,16 @@
+"compartment","cluster","n_features","n_core","n_traces","n_displayed_terms"
+"neuron",1,17539,17537,350,0
+"neuron",2,29406,29402,350,8
+"neuron",3,12562,12555,350,8
+"neuron",4,11707,11704,350,8
+"neuron",5,9152,9148,350,2
+"neuron",6,26387,26385,350,8
+"neuron",7,11546,11544,350,3
+"non_neuron",1,8008,8005,350,8
+"non_neuron",2,9871,9869,350,8
+"non_neuron",3,12696,12695,350,8
+"non_neuron",4,6730,6727,350,1
+"non_neuron",5,8527,8527,350,8
+"non_neuron",6,5922,5916,350,8
+"non_neuron",7,11452,11452,350,8
+"non_neuron",8,11856,11855,350,8

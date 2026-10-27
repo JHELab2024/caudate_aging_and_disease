@@ -1,0 +1,132 @@
+---
+title: "Fig. 4 | 06 Human metaprograms: age × AUD"
+output: html_document
+---
+
+Human MP scores (Fig. 1 notebook 07) in the AUD cohort, the same models as the gene-level analysis (`lmFit` + `eBayes`): four readouts from `~ age10 * AUD + sex + pool` (age centred at 50), spline × AUD F, AUD within each decade bin and bin × AUD. Second readout (Gavish): MP abundance in AUD vs AUD-cohort controls.
+
+```{r message=FALSE, warning=FALSE}
+  library(limma)
+  library(splines)
+  library(dplyr)
+  nmf = readRDS("../../data/derived/nmf_metaprograms.rds")
+  scores = readRDS("../../data/derived/nmf_scores_human.rds")
+  scores = scores[scores$id %in% nmf$info$id[nmf$info$keep_downstream], ]
+  dir.create("../results", recursive = TRUE, showWarnings = FALSE)
+  meta = readRDS("../../data/derived/human_pseudobulk.rds")$meta
+```
+
+# 1. Scores
+
+```{r}
+  results = list()
+  coverage = list()
+  for (ct in unique(scores$celltype)) {
+    s = scores[scores$celltype == ct, ]
+    mat = tapply(s$score, list(s$id, s$column), mean)
+    stopifnot(!anyDuplicated(s[, c("id", "column")]), all(is.finite(mat)), all(colnames(mat) %in% rownames(meta)))
+    m = meta[colnames(mat), ]
+    m = m[which(m$cohort == "AUD_cohort" & m$classification %in% c("Control", "AUD") & !is.na(m$age)), ]
+    m$AUD = factor(m$classification, levels = c("Control", "AUD"))
+    m$age10 = (m$age - 50) / 10
+    x = mat[, rownames(m), drop = FALSE]
+
+    # 1. four readouts
+    design = model.matrix(~ age10 * AUD + gender + dataset, data = m)
+    stopifnot(identical(rownames(design), rownames(m)), all(m$n_cells >= 15), !anyDuplicated(m$sample_names))
+    coverage[[paste(ct, "linear")]] = data.frame(celltype = ct, model = "linear", MPs = nrow(mat),
+      donors = nrow(m), design_columns = ncol(design), design_rank = qr(design)$rank,
+      residual_df = nrow(design) - qr(design)$rank, eligible = qr(design)$rank == ncol(design) & nrow(design) - ncol(design) >= 3)
+    if (qr(design)$rank < ncol(design) | nrow(design) - ncol(design) < 3) { message(ct, ": model not estimable"); next }
+    contrast = matrix(0, ncol(design), 4, dimnames = list(colnames(design), c("control_slope", "AUD_slope", "slope_difference", "AUD_shift_at_50")))
+    contrast["age10", "control_slope"] = 1
+    contrast[c("age10", "age10:AUDAUD"), "AUD_slope"] = 1
+    contrast["age10:AUDAUD", "slope_difference"] = 1
+    contrast["AUDAUD", "AUD_shift_at_50"] = 1
+    fit = eBayes(contrasts.fit(lmFit(x, design), contrast), robust = TRUE)
+    for (r in colnames(contrast)) {
+      results[[paste(ct, r)]] = data.frame(celltype = ct, contrast = r, id = rownames(mat), topTable(fit, coef = r, number = Inf, sort.by = "none"))
+    }
+
+    # 2. spline x AUD
+    nonlinear = svd(residuals(lm(ns(m$age, df = 3) ~ m$age)))$u[, 1:2]
+    m$nl1 = nonlinear[, 1]
+    m$nl2 = nonlinear[, 2]
+    design = model.matrix(~ (age10 + nl1 + nl2) * AUD + gender + dataset, data = m)
+    stopifnot(identical(rownames(design), rownames(m)), all(m$n_cells >= 15), !anyDuplicated(m$sample_names))
+    coverage[[paste(ct, "spline")]] = data.frame(celltype = ct, model = "spline", MPs = nrow(mat),
+      donors = nrow(m), design_columns = ncol(design), design_rank = qr(design)$rank,
+      residual_df = nrow(design) - qr(design)$rank, eligible = qr(design)$rank == ncol(design) & nrow(design) - ncol(design) >= 3)
+    if (qr(design)$rank == ncol(design) & nrow(design) - ncol(design) >= 3) {
+      fit = eBayes(lmFit(x, design), robust = TRUE)
+      curve = topTable(fit, coef = c("age10:AUDAUD", "nl1:AUDAUD", "nl2:AUDAUD"), number = Inf, sort.by = "none")
+      results[[paste(ct, "spline")]] = data.frame(celltype = ct, contrast = "spline_x_AUD", id = rownames(mat), F = curve$F, P.Value = curve$P.Value, adj.P.Val = curve$adj.P.Val)
+    }
+
+    # 3. decade bins
+    m$bin = as.character(cut(m$age, c(0, 40, 50, 60, 70, Inf), labels = c("D20_40", "D41_50", "D51_60", "D61_70", "D71_85")))
+    n = table(m$bin, m$classification)
+    ok = rownames(n)[n[, "Control"] >= 3 & n[, "AUD"] >= 3]
+    coverage[[paste(ct, "decade_bins")]] = data.frame(celltype = ct, model = "decade_bins", MPs = nrow(mat),
+      donors = sum(m$bin %in% ok), design_columns = NA_integer_, design_rank = NA_integer_, residual_df = NA_integer_,
+      eligible = FALSE, reason = "No bin has at least 3 donors in both Control and AUD")
+    if (length(ok) == 0) next
+    mb = m[m$bin %in% ok, ]
+    mb$group = factor(paste(mb$bin, mb$classification, sep = "_"))
+    design = model.matrix(~ 0 + group + gender + dataset, data = mb)
+    stopifnot(identical(rownames(design), rownames(mb)), all(mb$n_cells >= 15), !anyDuplicated(mb$sample_names))
+    coverage[[paste(ct, "decade_bins")]] = data.frame(celltype = ct, model = "decade_bins", MPs = nrow(mat),
+      donors = nrow(mb), design_columns = ncol(design), design_rank = qr(design)$rank,
+      residual_df = nrow(design) - qr(design)$rank, eligible = qr(design)$rank == ncol(design) & nrow(design) - ncol(design) >= 3)
+    if (qr(design)$rank < ncol(design) | nrow(design) - ncol(design) < 3) { message(ct, ": model not estimable"); next }
+    colnames(design) = sub("^group", "", colnames(design))
+    contrasts = c()
+    for (b in ok) contrasts[paste0("AUD_in_", b)] = paste0(b, "_AUD - ", b, "_Control")
+    if ("D20_40" %in% ok) for (b in setdiff(ok, "D20_40")) {
+      contrasts[paste0("binxAUD_", b, "_vs_D20_40")] = paste0("(", b, "_AUD - ", b, "_Control) - (D20_40_AUD - D20_40_Control)")
+    }
+    contrast = makeContrasts(contrasts = contrasts, levels = design)
+    colnames(contrast) = names(contrasts)
+    fit = eBayes(contrasts.fit(lmFit(x[, rownames(mb), drop = FALSE], design), contrast), robust = TRUE)
+    for (r in colnames(contrast)) {
+      results[[paste(ct, r)]] = data.frame(celltype = ct, contrast = r, id = rownames(mat), topTable(fit, coef = r, number = Inf, sort.by = "none"))
+    }
+  }
+  write.csv(bind_rows(coverage), "../results/NMF_AUD_model_coverage.csv", row.names = FALSE)
+  results = bind_rows(results)
+  write.csv(results, "../results/NMF_age_AUD.csv", row.names = FALSE)
+```
+
+Program abundance is descriptive because multiple programs from one donor are not independent donor replicates. All MPs remain eligible unless separately confirmed as technical noise.
+
+# 2. MP abundance in AUD vs controls
+
+```{r}
+  nmf = readRDS("../../data/derived/nmf_metaprograms.rds")
+  donors = unique(meta[, c("sample_names", "classification", "cohort")])
+  donors$context = "other"
+  donors$context[donors$cohort == "AUD_cohort" & donors$classification == "Control"] = "Control"
+  donors$context[donors$cohort == "AUD_cohort" & donors$classification == "AUD"] = "AUD"
+
+  abundance = list()
+  ids = nmf$info$id[nmf$info$keep_downstream & nmf$info$species == "human"]
+  for (ct in unique(nmf$info$celltype[match(ids, nmf$info$id)])) {
+    ct_ids = ids[nmf$info$celltype[match(ids, nmf$info$id)] == ct]
+    member = data.frame(id = rep(ct_ids, sapply(nmf$clusters[ct_ids], length)), program = unlist(nmf$clusters[ct_ids]))
+    member$context = donors$context[match(sub("\\|.*", "", member$program), donors$sample_names)]
+    stopifnot(!anyNA(member$context), !anyDuplicated(donors$sample_names))
+    total = nrow(member)
+    for (id in ct_ids) for (cx in c("Control", "AUD")) {
+      observed = sum(member$id == id & member$context == cx)
+      mp_size = sum(member$id == id)
+      context_size = sum(member$context == cx)
+      expected = mp_size * context_size / total
+      abundance[[paste(id, cx)]] = data.frame(celltype = ct, id = id, context = cx, observed = observed, expected = expected,
+                                              A = log2((observed + 1) / (expected + 1)),
+                                              p = phyper(observed - 1, mp_size, total - mp_size, context_size, lower.tail = FALSE))
+    }
+  }
+  abundance = bind_rows(abundance)
+  abundance$p_bonferroni = pmin(1, abundance$p * nrow(abundance))
+  write.csv(abundance, "../results/NMF_abundance_AUD.csv", row.names = FALSE)
+```

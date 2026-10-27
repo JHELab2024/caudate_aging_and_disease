@@ -1,0 +1,125 @@
+---
+title: "Fig6 native control and AUD age models"
+output: html_document
+---
+
+Run after `10_native_inputs.rmd`, from this directory. Pilot Astrocyte first by running the first loop iteration; the production loop then uses all eligible types. No Fig3/4 references enter this script. Feature-level nested tests use exact weighted residual-sum-of-squares differences and the full model's moderated residual variance; this avoids approximate covariance propagation for nonorthogonal weighted contrasts.
+
+```{r}
+library(edgeR)
+library(limma)
+library(Matrix)
+library(GenomicRanges)
+library(splines)
+library(dplyr)
+eligibility = read.csv("../results/native_dynamics/inputs/model_eligibility.csv")
+support = read.csv("../results/native_dynamics/inputs/age_support.csv")
+ref = readRDS("../../data/references/multiome_hg38_motifs_genes.rds")
+dir.create("../results/native_dynamics/models", recursive=TRUE, showWarnings=FALSE)
+coverage = list()
+for (ct in unique(eligibility$celltype)) {
+  p = readRDS(paste0("../../data/multiome_pseudobulk/", ct, ".rds"))
+  m = p$meta[which(p$meta$classification %in% c("Control", "AUD") & p$meta$n_cells >= 15 &
+    complete.cases(p$meta[, c("age", "gender", "dataset")])), ]
+  m$classification = factor(m$classification, levels=c("Control", "AUD"))
+  control = m$classification == "Control"
+  ns_control = ns(m$age[control], knots=quantile(m$age[control], c(1/3, 2/3)), Boundary.knots=range(m$age[control]))
+  linear_control = cbind(1, (m$age[control]-50)/10)
+  projection = qr.coef(qr(linear_control), ns_control)
+  rotation = svd(ns_control-linear_control %*% projection)$v[, 1:2, drop=FALSE]
+  basis = cbind(L=(m$age-50)/10, (predict(ns_control,m$age)-cbind(1,(m$age-50)/10) %*% projection) %*% rotation)
+  colnames(basis) = c("L", "N1", "N2")
+  grid = 20:85
+  B = cbind(L=(grid-50)/10, (predict(ns_control,grid)-cbind(1,(grid-50)/10) %*% projection) %*% rotation)
+  colnames(B) = colnames(basis)
+  sc = support[support$celltype == ct & support$diagnosis == "Control", ]
+  sa = support[support$celltype == ct & support$diagnosis == "AUD", ]
+  mask_control = sc$inside_range & sc$local_donors >= 5
+  mask_joint = mask_control & sa$inside_range & sa$local_donors >= 5
+  for (branch in c("control", "joint")) {
+    if (!eligibility$eligible[eligibility$celltype == ct & eligibility$branch == branch]) next
+    idx = if (branch == "control") which(control) else seq_len(nrow(m))
+    d = droplevels(m[idx, ]); mask = if (branch == "control") mask_control else mask_joint
+    center = colMeans(B[mask, , drop=FALSE]); bg = sweep(B, 2, center)
+    d[, c("L", "N1", "N2")] = sweep(basis[idx, , drop=FALSE], 2, center)
+    nuisance = c(if (length(unique(d$gender)) > 1) "gender", if (length(unique(d$dataset)) > 1) "dataset")
+    if (branch == "control") {
+      design = model.matrix(reformulate(c(nuisance, "L", "N1", "N2")), d)
+      reduced = list(age=design[, !colnames(design) %in% c("L", "N1", "N2"), drop=FALSE],
+        nonlinear=design[, !colnames(design) %in% c("N1", "N2"), drop=FALSE])
+    } else {
+      for (b in c("L", "N1", "N2")) {d[[paste0("control_",b)]] = d[[b]]*(d$classification == "Control"); d[[paste0("AUD_",b)]] = d[[b]]*(d$classification == "AUD")}
+      design = model.matrix(reformulate(c("classification", nuisance, paste0("control_",c("L","N1","N2")), paste0("AUD_",c("L","N1","N2")))), d)
+      reduced = list()
+      for (g in c("control", "AUD")) {
+        reduced[[paste0(g,"_age")]] = design[, !colnames(design) %in% paste0(g,"_",c("L","N1","N2")), drop=FALSE]
+        reduced[[paste0(g,"_nonlinear")]] = design[, !colnames(design) %in% paste0(g,"_",c("N1","N2")), drop=FALSE] }
+      reduced$curve_difference = model.matrix(reformulate(c("classification", nuisance, "L", "N1", "N2")), d)
+      reduced$mean_shift = design[, colnames(design) != "classificationAUD", drop=FALSE]
+    }
+    stopifnot(qr(design)$rank == ncol(design), nrow(design)-ncol(design) >= 10)
+    for (assay in c("RNA", "ATAC", "motif")) {
+      file = paste0("../results/native_dynamics/models/", ct, "__", assay, "__", branch, ".rds")
+      if (file.exists(file)) next
+      message(format(Sys.time()), " | ", ct, " | ", branch, " | ", assay)
+      if (assay != "motif") {
+        counts = p[[assay]][, rownames(d), drop=FALSE]
+        if (assay == "ATAC") counts = counts[intersect(rownames(counts), names(ref$peaks)), , drop=FALSE]
+        y = DGEList(counts); y = y[filterByExpr(y, design=design), , keep.lib.sizes=FALSE]; y = calcNormFactors(y)
+        v = voom(y, design, plot=FALSE, save.plot=TRUE)
+        E = v$E; weights = v$weights; normalization = y$samples
+        trend = list(xy=v$voom.xy, line=v$voom.line)
+      } else {
+        cv = readRDS(paste0("../results/chromvar/", ct, ".rds"))
+        E = cv$deviations[, rownames(d), drop=FALSE]
+        E = E[rowSums(!is.finite(E)) == 0 & apply(E,1,sd) > 0, , drop=FALSE]
+        weights = matrix(1, nrow(E), ncol(E)); normalization = NULL; trend = NULL
+      }
+      fit = lmFit(E, design, weights=weights); moderated = eBayes(fit, robust=TRUE)
+      rss_full = fit$sigma^2*fit$df.residual
+      tests = data.frame(feature=rownames(E), mean=rowMeans(E), residual_sd=fit$sigma, moderated_variance=moderated$s2.post,
+        df_total=moderated$df.total, row.names=NULL)
+      for (test in names(reduced)) {
+        reduced_fit = lmFit(E, reduced[[test]], weights=weights)
+        numerator_df = ncol(design)-ncol(reduced[[test]])
+        F = pmax(0, (reduced_fit$sigma^2*reduced_fit$df.residual-rss_full)/numerator_df/moderated$s2.post)
+        tests[[paste0(test,"_F")]] = F
+        tests[[paste0(test,"_p")]] = pf(F, numerator_df, moderated$df.total, lower.tail=FALSE)
+        tests[[paste0(test,"_q")]] = p.adjust(tests[[paste0(test,"_p")]], "BH")
+      }
+      prediction = list(); curves = list()
+      for (g in if (branch == "control") "Control" else c("Control", "AUD")) {
+        X = matrix(colMeans(design), nrow=length(grid), ncol=ncol(design), byrow=TRUE, dimnames=list(grid,colnames(design)))
+        if (branch == "control") X[,c("L","N1","N2")] = bg else {
+          X[, "classificationAUD"] = as.integer(g == "AUD")
+          X[, paste0("control_",c("L","N1","N2"))] = if (g == "Control") bg else 0
+          X[, paste0("AUD_",c("L","N1","N2"))] = if (g == "AUD") bg else 0 }
+        prediction[[g]] = X; curves[[g]] = fit$coefficients %*% t(X)
+        tests[[paste0(g,"_range")]] = apply(curves[[g]][,mask,drop=FALSE],1,function(z) diff(range(z)))
+        curves[[g]][,!mask] = NA_real_
+      }
+      if (branch == "joint") {
+        prediction$difference = prediction$AUD-prediction$Control
+        curves$difference = curves$AUD-curves$Control
+        tests$mean_shift = fit$coefficients[, "classificationAUD"]
+        tests$mean_shift_se = fit$stdev.unscaled[, "classificationAUD"]*sqrt(moderated$s2.post)
+      }
+      residual = E-fit$coefficients %*% t(design)
+      donor_diagnostics = data.frame(donor=rownames(d), residual_rms=sqrt(colMeans(weights*residual^2)))
+      result = list(celltype=ct, assay=assay, branch=branch, tests=tests, meta=d, design=design, reduced=reduced,
+        E=E, weights=weights, fit=fit, s2_post=moderated$s2.post, df_total=moderated$df.total, grid=grid, mask=mask,
+        prediction=prediction, curves=curves, normalization=normalization, voom_trend=trend, donor_diagnostics=donor_diagnostics,
+        basis=list(ns=ns_control, projection=projection, rotation=rotation, center=center), seed=20261016)
+      saveRDS(result, file, compress="gzip")
+      write.csv(tests, gzfile(sub("\\.rds$", "_tests.csv.gz",file)), row.names=FALSE)
+      for (test in names(reduced)) coverage[[paste(ct,branch,assay,test)]] = data.frame(celltype=ct,branch=branch,assay=assay,test=test,
+        features=nrow(E),donors=nrow(d),q05=sum(tests[[paste0(test,"_q")]] < .05),p05=sum(tests[[paste0(test,"_p")]] < .05))
+      write.csv(bind_rows(coverage), "../results/native_dynamics/model_test_counts.csv", row.names=FALSE)
+      rm(E,weights,fit,moderated,result,residual); gc(verbose=FALSE)
+    }
+  }
+}
+writeLines(capture.output(sessionInfo()), "../results/native_dynamics/models/session.txt")
+```
+
+Saved curves share a common covariate target within each fitted model. Control-only discovery and joint comparison are distinct estimands: comparison figures must use the joint model for **both** diagnoses. Pointwise feature CIs are computed later from each feature's exact weighted information matrix and moderated variance; simultaneous bands are not claimed. Library normalization yields relative accessibility/expression, not a global opening measurement.
